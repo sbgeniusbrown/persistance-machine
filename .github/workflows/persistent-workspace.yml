@@ -1,0 +1,661 @@
+# .github/workflows/persistent-workspace.yml
+#
+# Persistent cloud dev box, driven by the persistance-machine web app.
+#
+#  * Every machine has an opaque machine_id. Names live only in the encrypted
+#    registry files (machines/*.enc), never in run inputs or release tags.
+#  * All work lives in ONE sparse ext4 disk image; Docker's data-root is on it.
+#  * On a clean stop (touch /STOP inside the box, or the session budget runs
+#    out) the image is cut into chunks, ZSTD-compressed, AES-256 ENCRYPTED with
+#    the SNAPSHOT_KEY repo secret, and uploaded to a NEW release. Then an
+#    encrypted record snapshots/<tag>.enc is committed. Snapshots are never
+#    deleted or overwritten.
+#  * Cancelling the run (or any failure) uploads NOTHING. The runner just dies.
+#  * Tunnel URLs + code-server password are written to session.enc in the repo
+#    root, encrypted to the repo's RSA public key (public.pem). Only the web
+#    app (which holds the private key, unlocked by your password) can read it.
+#  * Nothing sensitive is printed to the logs: this repo is public.
+
+name: Persistent Workspace
+run-name: "ws ${{ inputs.session_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      machine_id:
+        description: "Opaque machine id (set by the web app)"
+        type: string
+        required: true
+      session_id:
+        description: "Opaque session id (set by the web app)"
+        type: string
+        required: true
+      mode:
+        description: "new = fresh disk, resume = restore snapshot_tag"
+        type: choice
+        required: true
+        default: new
+        options:
+          - new
+          - resume
+      snapshot_tag:
+        description: "Release tag to restore (required for resume)"
+        type: string
+        required: false
+        default: ""
+      force_rebuild:
+        description: "Discard the existing container and recreate from the Dockerfile below"
+        type: boolean
+        required: false
+        default: false
+      session_minutes:
+        description: "Session length before auto-snapshot (hard cap 240)"
+        type: string
+        required: false
+        default: "240"
+      image_size:
+        description: "Disk image size (mode=new only), e.g. 70G"
+        type: string
+        required: false
+        default: "70G"
+      chunk_mb:
+        description: "Release asset chunk size in MiB"
+        type: string
+        required: false
+        default: "1536"
+      compress_level:
+        description: "zstd level. 0 = no compression"
+        type: string
+        required: false
+        default: "3"
+      resolution:
+        description: "Desktop resolution WIDTHxHEIGHT (set by the web app)"
+        type: string
+        required: false
+        default: "1920x1080"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: persistent-workspace
+  cancel-in-progress: false
+
+env:
+  IMG: /mnt/workspace-disk/disk.img
+  MNT: /snapdisk
+  CHUNKDIR: /home/runner/chunks
+  CONTAINER: workspace
+  IDE_PORT: "8080"
+  NOVNC_PORT: "6081"
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  BRANCH: ${{ github.event.repository.default_branch }}
+  SESSION_ID: ${{ inputs.session_id }}
+  MACHINE_ID: ${{ inputs.machine_id }}
+  RESOLUTION: ${{ inputs.resolution }}
+  SNAPSHOT_KEY: ${{ secrets.SNAPSHOT_KEY }}
+
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    steps:
+      - name: Checkout (shallow, for public.pem)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install required tools
+        run: |
+          set -euo pipefail
+          sudo apt-get -y install zstd jq xxd >/dev/null 2>&1 || true
+          df -h / /mnt
+
+      - name: Preflight and helpers
+        run: |
+          set -euo pipefail
+          [[ "$SESSION_ID" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad session_id"; exit 1; }
+          [[ "$MACHINE_ID" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad machine_id"; exit 1; }
+          if [ -z "$SNAPSHOT_KEY" ]; then
+            echo "::error::Repo secret SNAPSHOT_KEY is missing. Use 'Repair setup' in the web app."
+            exit 1
+          fi
+          [ -f public.pem ] || { echo "::error::public.pem missing from repo root"; exit 1; }
+          if [ "${{ inputs.mode }}" = "resume" ] && [ -z "${{ inputs.snapshot_tag }}" ]; then
+            echo "::error::mode=resume needs snapshot_tag"; exit 1
+          fi
+
+          cat > /home/runner/lib.sh <<'LIB'
+          # Hybrid encryption to the repo's RSA public key:
+          #   random AES-256-CBC key+iv encrypts the payload;
+          #   key+iv (48 bytes) is RSA-OAEP(SHA-256) wrapped.
+          # Output: {"v":1,"k":<b64 wrapped key>,"d":<b64 ciphertext>}
+          enc_to() {
+            local in="$1" out="$2" t key iv
+            t=$(mktemp -d)
+            key=$(openssl rand -hex 32); iv=$(openssl rand -hex 16)
+            openssl enc -aes-256-cbc -K "$key" -iv "$iv" -in "$in" -out "$t/ct"
+            printf '%s%s' "$key" "$iv" | xxd -r -p > "$t/kiv"
+            openssl pkeyutl -encrypt -pubin -inkey "${PUBPEM:-$GITHUB_WORKSPACE/public.pem}" \
+              -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+              -pkeyopt rsa_mgf1_md:sha256 -in "$t/kiv" -out "$t/k"
+            jq -nc --arg k "$(base64 -w0 "$t/k")" --arg d "$(base64 -w0 "$t/ct")" \
+              '{v:1,k:$k,d:$d}' > "$out"
+            rm -rf "$t"
+          }
+
+          # Create/update a file in the repo through the contents API.
+          put_repo_file() {
+            local path="$1" file="$2" msg="$3" sha i args
+            for i in 1 2 3 4 5; do
+              sha=$(gh api "repos/$REPO/contents/$path?ref=$BRANCH" --jq .sha 2>/dev/null || true)
+              args=()
+              [ -n "$sha" ] && args+=(-f "sha=$sha")
+              if gh api -X PUT "repos/$REPO/contents/$path" -f "message=$msg" \
+                   -f "branch=$BRANCH" -f "content=$(base64 -w0 "$file")" \
+                   "${args[@]}" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 3
+            done
+            echo "::warning::could not write $path"
+            return 1
+          }
+
+          # write_session <status> [ide_url] [ide_password] [desktop_url]
+          write_session() {
+            local f; f=$(mktemp)
+            jq -nc --arg sid "$SESSION_ID" --arg mid "$MACHINE_ID" --arg st "$1" \
+                   --arg ide "${2:-}" --arg pw "${3:-}" --arg vnc "${4:-}" \
+                   --arg t "$(date -u +%FT%TZ)" \
+                   '{session_id:$sid,machine_id:$mid,status:$st,ide_url:$ide,
+                     ide_password:$pw,desktop_url:$vnc,updated:$t}' > "$f.json"
+            enc_to "$f.json" "$f.enc"
+            put_repo_file session.enc "$f.enc" "session: $1"
+            rm -f "$f" "$f.json" "$f.enc"
+          }
+          LIB
+
+          source /home/runner/lib.sh
+          write_session starting || true
+
+      - name: Create fresh disk image
+        if: ${{ inputs.mode == 'new' }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$(dirname "$IMG")"
+          sudo truncate -s "${{ inputs.image_size }}" "$IMG"
+          sudo mkfs.ext4 -F -m 0 -i 65536 -L workspace "$IMG"
+          ls -lh "$IMG"; du -h --apparent-size "$IMG"; du -h "$IMG"
+
+      - name: Restore disk image from release chunks
+        if: ${{ inputs.mode == 'resume' }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.snapshot_tag }}"
+          sudo mkdir -p "$(dirname "$IMG")" "$CHUNKDIR"
+          sudo chown "$USER" "$(dirname "$IMG")" "$CHUNKDIR"
+
+          gh release download "$TAG" -p manifest.json -D "$CHUNKDIR" --clobber
+          MAN="$CHUNKDIR/manifest.json"
+
+          TOTAL=$(jq -r .image_bytes "$MAN")
+          CHUNK_MB=$(jq -r .chunk_mb "$MAN")
+          N=$(jq -r '.chunks | length' "$MAN")
+          COMP=$(jq -r .compression "$MAN")
+          ENC=$(jq -r '.encryption // "none"' "$MAN")
+          echo "restoring $TAG: $N chunks, compression=$COMP, encryption=$ENC"
+
+          truncate -s "$TOTAL" "$IMG"
+
+          dec() {
+            if [ "$ENC" = "aes256cbc-pbkdf2" ]; then
+              openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SNAPSHOT_KEY -in "$1"
+            else
+              cat "$1"
+            fi
+          }
+          fetch_one() {
+            local idx="$1" name="$2" sha="$3"
+            local dest="$CHUNKDIR/$name"
+            for try in 1 2 3; do
+              rm -f "$dest"
+              if gh release download "$TAG" -p "$name" -D "$CHUNKDIR" --clobber; then
+                if [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sha" ]; then
+                  break
+                fi
+                echo "checksum mismatch on $name (attempt $try)" >&2
+              fi
+              [ "$try" = 3 ] && { echo "::error::failed to fetch $name"; exit 1; }
+              sleep 5
+            done
+            local seek=$(( idx * CHUNK_MB ))
+            if [ "$COMP" = "zstd" ]; then
+              dec "$dest" | zstd -dc | dd of="$IMG" bs=1M seek="$seek" \
+                   conv=notrunc,sparse iflag=fullblock status=none
+            else
+              dec "$dest" | dd of="$IMG" bs=1M seek="$seek" \
+                   conv=notrunc,sparse iflag=fullblock status=none
+            fi
+            rm -f "$dest"
+            echo "restored chunk $idx/$N"
+          }
+          export -f fetch_one dec
+          export TAG CHUNKDIR IMG CHUNK_MB COMP ENC N GH_TOKEN SNAPSHOT_KEY
+
+          jq -r '.chunks[] | "\(.index)\t\(.name)\t\(.sha256)"' "$MAN" \
+            | xargs -P 4 -n 3 bash -c 'set -eo pipefail; fetch_one "$0" "$1" "$2"'
+
+          echo "Image reassembled:"; ls -lh "$IMG"; du -h "$IMG"
+          sudo e2fsck -p -f "$IMG" || true
+
+      - name: Mount image and move Docker onto it
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$MNT"
+          LOOP=$(sudo losetup --find --show "$IMG")
+          echo "LOOP=$LOOP" >> "$GITHUB_ENV"
+          sudo mount -o discard,noatime "$LOOP" "$MNT"
+          sudo mkdir -p "$MNT/docker" "$MNT/home"
+          df -h "$MNT"
+
+          sudo systemctl stop docker docker.socket containerd || true
+          echo '{ "data-root": "'"$MNT"'/docker", "storage-driver": "overlay2" }' \
+            | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          sudo docker info --format 'Docker Root Dir: {{.DockerRootDir}}'
+
+      # Builds the image every run (cheap on resume: layer cache is on the
+      # persisted disk). Whether the CONTAINER is recreated depends on
+      # force_rebuild - see the next step.
+      - name: Build workspace image
+        run: |
+          set -euo pipefail
+          BUILD=$(mktemp -d)
+
+          cat > "$BUILD/entrypoint.sh" <<'EOS'
+          #!/usr/bin/env bash
+          set -u
+
+          IDE_PORT=8080
+          VNC_PORT=5901
+          NOVNC_PORT=6081
+
+          mkdir -p /root/.config/code-server /root/.vnc /var/log /workspace
+
+          # Desktop size chosen in the web app (written by the workflow before start).
+          GEOMETRY=1920x1080
+          [ -f /root/.config/desktop-resolution ] && GEOMETRY=$(tr -d '[:space:]' < /root/.config/desktop-resolution)
+          [[ "$GEOMETRY" =~ ^[0-9]{3,4}x[0-9]{3,4}$ ]] || GEOMETRY=1920x1080
+
+          CFG=/root/.config/code-server/config.yaml
+          if [ ! -f "$CFG" ]; then
+            PW=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
+            cat > "$CFG" <<EOF
+          bind-addr: 0.0.0.0:$IDE_PORT
+          auth: password
+          password: $PW
+          cert: false
+          EOF
+          fi
+          rm -f /tmp/tunnel_url /tmp/vnc_tunnel_url /STOP
+
+          code-server >>/var/log/code-server.log 2>&1 &
+          for _ in $(seq 1 60); do
+            (echo >/dev/tcp/127.0.0.1/$IDE_PORT) >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          cat > /root/.vnc/xstartup <<'EOSX'
+          #!/bin/sh
+          unset SESSION_MANAGER
+          export XDG_CURRENT_DESKTOP="KDE"
+          export XDG_SESSION_TYPE="x11"
+          export XDG_RUNTIME_DIR="/tmp/xdg-runtime-root"
+          mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
+          export KWIN_COMPOSE=N
+          export KWIN_OPENGL_INTERFACE=none
+          export QT_XCB_GL_INTEGRATION=none
+          exec startplasma-x11
+          EOSX
+          chmod +x /root/.vnc/xstartup
+
+          # DEBUG: -SecurityTypes None = NO password on the desktop. The
+          # tunnel URL is the only secret, and it is only ever written
+          # encrypted (session.enc).
+          supervise_xvnc() {
+            while true; do
+              pkill -9 -f 'Xvnc :1' >/dev/null 2>&1 || true
+              rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+              sleep 1
+              Xvnc :1 \
+                -geometry "$GEOMETRY" -depth 24 \
+                -rfbport "$VNC_PORT" \
+                -SecurityTypes None \
+                -AlwaysShared -AcceptSetDesktopSize \
+                -desktop devbox \
+                >>/var/log/xvnc.log 2>&1
+              CODE=$?
+              echo "[entrypoint] Xvnc exited (code $CODE), restarting" >> /var/log/xvnc.log
+              sleep 2
+            done
+          }
+          supervise_xvnc &
+
+          for _ in $(seq 1 30); do
+            DISPLAY=:1 xdpyinfo >/dev/null 2>&1 && break
+            sleep 1
+          done
+          export DISPLAY=:1
+          dbus-launch --exit-with-session /root/.vnc/xstartup \
+            >>/var/log/plasma.log 2>&1 &
+
+          supervise_websockify() {
+            while true; do
+              websockify --web=/usr/share/novnc "$NOVNC_PORT" "127.0.0.1:$VNC_PORT" \
+                >>/var/log/websockify.log 2>&1
+              CODE=$?
+              echo "[entrypoint] websockify exited (code $CODE), restarting" >> /var/log/websockify.log
+              sleep 2
+            done
+          }
+          supervise_websockify &
+
+          supervise_tunnel() {
+            local port="$1" urlfile="$2" logfile="$3"
+            while true; do
+              : > "$logfile"
+              cloudflared tunnel --url "http://127.0.0.1:${port}" --no-autoupdate \
+                --logfile "$logfile" >>"$logfile" 2>&1 &
+              CF=$!
+              for _ in $(seq 1 90); do
+                URL=$(grep -ohE 'https://[a-z0-9-]+\.trycloudflare\.com' \
+                      "$logfile" 2>/dev/null | head -n1)
+                [ -n "${URL:-}" ] && { echo "$URL" > "$urlfile"; break; }
+                sleep 2
+              done
+              wait "$CF"
+              echo "[entrypoint] cloudflared ($port) exited, restarting" >> "$logfile"
+              rm -f "$urlfile"
+              sleep 3
+            done
+          }
+          supervise_tunnel "$IDE_PORT"   /tmp/tunnel_url     /var/log/cloudflared.log &
+          supervise_tunnel "$NOVNC_PORT" /tmp/vnc_tunnel_url /var/log/cloudflared-vnc.log &
+
+          wait -n
+          EOS
+
+          cat > "$BUILD/Dockerfile" <<'EOF'
+          FROM ubuntu:24.04
+          ENV DEBIAN_FRONTEND=noninteractive SHELL=/bin/bash
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                ca-certificates curl wget git openssh-client sudo nano vim \
+                build-essential python3 python3-pip python3-venv unzip zip \
+                jq htop tmux less locales dumb-init procps psmisc \
+                kde-plasma-desktop plasma-workspace kwin-x11 dolphin konsole \
+                tigervnc-standalone-server tigervnc-common \
+                dbus-x11 x11-xserver-utils x11-utils novnc websockify \
+              && rm -rf /var/lib/apt/lists/*
+          RUN curl -fsSL https://code-server.dev/install.sh | sh
+          RUN arch="$(dpkg --print-architecture)" \
+              && curl -fsSL -o /tmp/cf.deb \
+                 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb" \
+              && dpkg -i /tmp/cf.deb && rm /tmp/cf.deb
+          RUN curl -L -o /tmp/firefox.tar.xz "https://download.mozilla.org/?product=firefox-latest&os=linux64&lang=en-US" \
+              && tar xf /tmp/firefox.tar.xz -C /opt \
+              && ln -sf /opt/firefox/firefox /usr/local/bin/firefox \
+              && rm /tmp/firefox.tar.xz
+          RUN ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
+          COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+          RUN chmod +x /usr/local/bin/entrypoint.sh
+          WORKDIR /workspace
+          EXPOSE 8080 6081
+          ENTRYPOINT ["dumb-init","--","/usr/local/bin/entrypoint.sh"]
+          EOF
+
+          sudo docker build -t workspace:latest "$BUILD"
+
+      # If the container already exists and force_rebuild is false we just
+      # `docker start` it: its writable layer lives under Docker's data-root
+      # on the persisted disk, so the whole filesystem comes back as it was.
+      - name: Start or recreate container
+        run: |
+          set -euo pipefail
+
+          # Passwordless code-server. /root is bind-mounted from the persisted
+          # disk and the entrypoint only writes a config when none exists, so
+          # write the config here, on the host side, before every start. This
+          # also switches machines whose old config still has a password.
+          sudo mkdir -p "$MNT/home/.config/code-server"
+          sudo tee "$MNT/home/.config/code-server/config.yaml" >/dev/null <<'EOF'
+          bind-addr: 0.0.0.0:8080
+          auth: none
+          cert: false
+          EOF
+
+          # Desktop resolution for this session, read by the entrypoint from /root.
+          RES="${RESOLUTION:-1920x1080}"
+          if ! [[ "$RES" =~ ^[0-9]{3,4}x[0-9]{3,4}$ ]]; then
+            echo "::warning::invalid resolution input, using 1920x1080"; RES=1920x1080
+          fi
+          echo "$RES" | sudo tee "$MNT/home/.config/desktop-resolution" >/dev/null
+
+          EXISTS=$(sudo docker ps -aq -f name="^${CONTAINER}$" || true)
+
+          if [ -n "$EXISTS" ] && [ "${{ inputs.force_rebuild }}" != "true" ]; then
+            echo "Existing container found - starting it as-is."
+            sudo docker start "$CONTAINER"
+          else
+            if [ -n "$EXISTS" ]; then
+              echo "force_rebuild=true - discarding existing container."
+            else
+              echo "No existing container - creating fresh."
+            fi
+            sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+            sudo docker run -d --name "$CONTAINER" --restart unless-stopped \
+              --hostname devbox \
+              --shm-size=1g \
+              -v "$MNT/home:/root" \
+              -p 127.0.0.1:${IDE_PORT}:8080 \
+              -p 127.0.0.1:${NOVNC_PORT}:6081 \
+              workspace:latest
+          fi
+          sudo docker ps
+
+      - name: Publish connection details (encrypted)
+        run: |
+          set -uo pipefail
+          source /home/runner/lib.sh
+          URL=""; VNC_URL=""
+          for _ in $(seq 1 90); do
+            [ -z "$URL" ] && URL=$(sudo docker exec "$CONTAINER" cat /tmp/tunnel_url 2>/dev/null || true)
+            [ -z "$VNC_URL" ] && VNC_URL=$(sudo docker exec "$CONTAINER" cat /tmp/vnc_tunnel_url 2>/dev/null || true)
+            [ -n "$URL" ] && [ -n "$VNC_URL" ] && break
+            sleep 4
+          done
+          PW=$(sudo docker exec "$CONTAINER" \
+                 sed -n 's/^password: //p' /root/.config/code-server/config.yaml 2>/dev/null || true)
+          # Public repo => public logs. Mask everything sensitive.
+          for v in "$URL" "$VNC_URL" "$PW"; do [ -n "$v" ] && echo "::add-mask::$v"; done
+          [ -z "$URL" ] && echo "::warning::code-server tunnel not up yet"
+          [ -z "$VNC_URL" ] && echo "::warning::desktop tunnel not up yet"
+          DESK=""
+          [ -n "$VNC_URL" ] && DESK="${VNC_URL}/vnc.html?resize=scale&autoconnect=1"
+          write_session running "$URL" "$PW" "$DESK"
+          {
+            echo "## Workspace is up"
+            echo ""
+            echo "Connection details are encrypted in \`session.enc\`. Open the web app to see them."
+            echo ""
+            echo "Run \`touch /STOP\` in the IDE terminal to end the session and save a snapshot."
+            echo "Cancelling this run discards everything since the last snapshot."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hold the session open
+        id: hold
+        run: |
+          set -uo pipefail
+          source /home/runner/lib.sh
+          MINUTES=${{ inputs.session_minutes }}
+          if [ "$MINUTES" -gt 240 ] || [ "$MINUTES" -le 0 ]; then MINUTES=240; fi
+          BUDGET=$(( MINUTES * 60 ))
+          START=$(date +%s)
+          LAST_URL=$(sudo docker exec "$CONTAINER" cat /tmp/tunnel_url 2>/dev/null || true)
+          LAST_VNC=$(sudo docker exec "$CONTAINER" cat /tmp/vnc_tunnel_url 2>/dev/null || true)
+          PW=$(sudo docker exec "$CONTAINER" \
+                 sed -n 's/^password: //p' /root/.config/code-server/config.yaml 2>/dev/null || true)
+          [ -n "$PW" ] && echo "::add-mask::$PW"
+          while true; do
+            NOW=$(date +%s); ELAPSED=$(( NOW - START ))
+            if [ "$ELAPSED" -ge "$BUDGET" ]; then
+              echo "Session budget reached."; echo "clean=true" >> "$GITHUB_OUTPUT"; break
+            fi
+            if sudo docker exec "$CONTAINER" test -f /STOP 2>/dev/null; then
+              echo "/STOP found - wrapping up."; echo "clean=true" >> "$GITHUB_OUTPUT"; break
+            fi
+            if ! sudo docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+              echo "::warning::Container is gone, restarting it."
+              sudo docker start "$CONTAINER" || true
+            fi
+
+            URL=$(sudo docker exec "$CONTAINER" cat /tmp/tunnel_url 2>/dev/null || true)
+            VNC=$(sudo docker exec "$CONTAINER" cat /tmp/vnc_tunnel_url 2>/dev/null || true)
+            if { [ -n "$URL" ] && [ "$URL" != "$LAST_URL" ]; } || \
+               { [ -n "$VNC" ] && [ "$VNC" != "$LAST_VNC" ]; }; then
+              for v in "$URL" "$VNC"; do [ -n "$v" ] && echo "::add-mask::$v"; done
+              LAST_URL="${URL:-$LAST_URL}"; LAST_VNC="${VNC:-$LAST_VNC}"
+              DESK=""; [ -n "$LAST_VNC" ] && DESK="${LAST_VNC}/vnc.html?resize=scale&autoconnect=1"
+              echo "tunnel URL changed - updating session.enc"
+              write_session running "$LAST_URL" "$PW" "$DESK"
+            fi
+
+            if [ $(( ELAPSED % 600 )) -lt 30 ]; then
+              printf '[%s] alive %dm/%dm\n' "$(date -u +%H:%M:%S)" $((ELAPSED/60)) $((BUDGET/60))
+              df -h "$MNT" | tail -n1
+            fi
+            sleep 30
+          done
+
+      # Everything below runs ONLY after a clean stop. On cancel or failure
+      # these steps are skipped: no snapshot, no upload.
+      - name: Quiesce and unmount the image
+        if: ${{ steps.hold.outputs.clean == 'true' }}
+        run: |
+          set -euo pipefail
+          source /home/runner/lib.sh
+          write_session snapshotting || true
+          sudo docker stop -t 60 "$CONTAINER" || true
+          sudo fstrim -v "$MNT" || true
+          sync
+          sudo systemctl stop docker docker.socket containerd || true
+          sudo umount "$MNT"
+          sudo e2fsck -p -f "$IMG" || true
+          echo "apparent: $(du -h --apparent-size "$IMG" | cut -f1)   on-disk: $(du -h "$IMG" | cut -f1)"
+
+      - name: Snapshot to a new release
+        if: ${{ steps.hold.outputs.clean == 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$CHUNKDIR/meta"
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          TAG="snap-${TS}-${{ github.run_id }}"
+          CHUNK_MB=${{ inputs.chunk_mb }}
+          LEVEL=${{ inputs.compress_level }}
+          TOTAL=$(stat -c%s "$IMG")
+          CHUNK_B=$(( CHUNK_MB * 1024 * 1024 ))
+          N=$(( (TOTAL + CHUNK_B - 1) / CHUNK_B ))
+          if [ "$LEVEL" -gt 0 ]; then COMP=zstd; EXT=".zst"; else COMP=none; EXT=""; fi
+
+          PARENT=""
+          [ "${{ inputs.mode }}" = "resume" ] && PARENT="${{ inputs.snapshot_tag }}"
+
+          gh release create "$TAG" \
+            --title "Workspace snapshot $TS" \
+            --notes "Encrypted workspace snapshot (AES-256). Use the persistance-machine web app to resume."
+
+          upload_one() {
+            local i="$1"
+            local name; name=$(printf 'disk.part.%05d.img%s.enc' "$i" "$EXT")
+            local dest="$CHUNKDIR/$name"
+            # read chunk -> (zstd) -> AES-256 encrypt; only the small
+            # finished file ever touches disk.
+            if [ "$COMP" = zstd ]; then
+              sudo dd if="$IMG" bs=1M skip=$(( i * CHUNK_MB )) count="$CHUNK_MB" \
+                   iflag=fullblock status=none \
+                | zstd -q -T2 -"$LEVEL" \
+                | openssl enc -aes-256-cbc -pbkdf2 -pass env:SNAPSHOT_KEY -out "$dest"
+            else
+              sudo dd if="$IMG" bs=1M skip=$(( i * CHUNK_MB )) count="$CHUNK_MB" \
+                   iflag=fullblock status=none \
+                | openssl enc -aes-256-cbc -pbkdf2 -pass env:SNAPSHOT_KEY -out "$dest"
+            fi
+            local sha size
+            sha=$(sha256sum "$dest" | cut -d' ' -f1)
+            size=$(stat -c%s "$dest")
+            for try in 1 2 3; do
+              gh release upload "$TAG" "$dest" --clobber && break
+              [ "$try" = 3 ] && { echo "::error::upload failed for $name"; exit 1; }
+              sleep 10
+            done
+            rm -f "$dest"
+            jq -nc --argjson index "$i" --arg name "$name" \
+                   --arg sha256 "$sha" --argjson bytes "$size" \
+                   '{index:$index,name:$name,sha256:$sha256,bytes:$bytes}' \
+              > "$CHUNKDIR/meta/$(printf '%05d' "$i").json"
+            echo "uploaded chunk $i/$N ($(numfmt --to=iec "$size"))"
+          }
+          export -f upload_one
+          export IMG CHUNKDIR CHUNK_MB LEVEL COMP EXT TAG GH_TOKEN SNAPSHOT_KEY N
+
+          seq 0 $(( N - 1 )) | xargs -P 3 -n 1 bash -c 'set -eo pipefail; upload_one "$0"'
+
+          jq -s --arg tag "$TAG" --arg ts "$TS" --arg comp "$COMP" \
+                --argjson total "$TOTAL" --argjson cmb "$CHUNK_MB" \
+                --argjson level "$LEVEL" --arg parent "${PARENT:-}" \
+                --arg run "${{ github.run_id }}" \
+             '{schema:2, tag:$tag, created_utc:$ts, image_bytes:$total,
+               chunk_mb:$cmb, compression:$comp, compression_level:$level,
+               encryption:"aes256cbc-pbkdf2",
+               filesystem:"ext4", parent:$parent, run_id:$run,
+               chunks: (. | sort_by(.index))}' \
+             "$CHUNKDIR"/meta/*.json > "$CHUNKDIR/manifest.json"
+          gh release upload "$TAG" "$CHUNKDIR/manifest.json" --clobber
+
+          UPLOADED=$(jq '[.chunks[].bytes] | add' "$CHUNKDIR/manifest.json")
+
+          # Registry record, committed LAST: a snapshot only "exists" for the
+          # web app once every chunk and the manifest are safely uploaded.
+          source /home/runner/lib.sh
+          jq -nc --arg mid "$MACHINE_ID" --arg tag "$TAG" --arg ts "$TS" \
+                 --arg parent "${PARENT:-}" --arg comp "$COMP" \
+                 --arg run "${{ github.run_id }}" --arg sid "$SESSION_ID" \
+                 --argjson total "$TOTAL" --argjson up "$UPLOADED" \
+                 --argjson n "$N" --argjson cmb "$CHUNK_MB" \
+                 '{machine_id:$mid,tag:$tag,created_utc:$ts,parent:$parent,
+                   image_bytes:$total,uploaded_bytes:$up,chunk_count:$n,
+                   chunk_mb:$cmb,compression:$comp,run_id:$run,session_id:$sid}' \
+            > "$CHUNKDIR/record.json"
+          enc_to "$CHUNKDIR/record.json" "$CHUNKDIR/record.enc"
+          put_repo_file "snapshots/$TAG.enc" "$CHUNKDIR/record.enc" "snapshot $TAG"
+          write_session done || true
+
+          {
+            echo ""
+            echo "## Snapshot saved"
+            echo ""
+            echo "- Tag: \`$TAG\`"
+            echo "- Chunks: $N x ${CHUNK_MB} MiB windows, $COMP, encrypted"
+            echo "- Uploaded: $(numfmt --to=iec "$UPLOADED") (image is $(numfmt --to=iec "$TOTAL") virtual)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tear down
+        if: ${{ always() }}
+        run: |
+          sudo umount "$MNT" 2>/dev/null || true
+          [ -n "${LOOP:-}" ] && sudo losetup -d "$LOOP" 2>/dev/null || true
+          sudo rm -f "$IMG" || true
+          df -h / /mnt || true
+
